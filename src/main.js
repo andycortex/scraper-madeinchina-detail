@@ -1,40 +1,85 @@
-/**
- * This template is a production ready boilerplate for developing with `PlaywrightCrawler`.
- * Use this to bootstrap your projects using the most up-to-date code.
- * If you're looking for examples or want to learn more, see README.
- */
-
-// For more information, see https://crawlee.dev
-import { PlaywrightCrawler } from '@crawlee/playwright';
-// For more information, see https://docs.apify.com/sdk/js
+import { PlaywrightCrawler, Dataset, log } from '@crawlee/playwright';
 import { Actor } from 'apify';
-
-// this is ESM project, and as such, it requires you to specify extensions in your relative imports
-// read more about this here: https://nodejs.org/docs/latest-v18.x/api/esm.html#mandatory-file-extensions
 import { router } from './routes.js';
+import { setTimeout } from 'node:timers/promises';
 
-// Initialize the Apify SDK
 await Actor.init();
 
-const { startUrls = ['https://apify.com'] } = (await Actor.getInput()) ?? {};
+const input = await Actor.getInput();
+if (!input?.startUrls?.length) {
+    throw new Error('No startUrls provided in input.');
+}
 
-// `checkAccess` flag ensures the proxy credentials are valid, but the check can take a few hundred milliseconds.
-// Disable it for short runs if you are sure your proxy configuration is correct
-const proxyConfiguration = await Actor.createProxyConfiguration({ checkAccess: true });
+// === Bright Data Scraping Browser ===
+const BRIGHTDATA_WS = 'wss://brd-customer-hl_d6363161-zone-scraping_browser_madeinchina:h58qk983tfgf@brd.superproxy.io:9222';
 
 const crawler = new PlaywrightCrawler({
-    proxyConfiguration,
-    requestHandler: router,
+    // Conectar al browser remoto de Bright Data
     launchContext: {
         launchOptions: {
-            args: [
-                '--disable-gpu', // Mitigates the "crashing GPU process" issue in Docker containers
-            ],
+            // No lanzamos browser local, usamos el remoto
         },
+    },
+
+    // Usamos el endpoint CDP de Bright Data
+    browserPoolOptions: {
+        useFingerprints: false, // Bright Data ya maneja el fingerprint
+    },
+
+    // Configuración importante para Scraping Browser
+    preNavigationHooks: [
+        async ({ page, request }) => {
+            // Opcional: headers extra
+            await page.setExtraHTTPHeaders({
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://www.made-in-china.com/',
+            });
+        },
+    ],
+
+    requestHandler: router,
+
+    // Timeouts más generosos (Made-in-China es lento)
+    navigationTimeoutSecs: 90,
+    requestHandlerTimeoutSecs: 120,
+
+    // Reintentos
+    maxRequestRetries: 3,
+
+    // Delays entre requests
+    minConcurrency: 1,
+    maxConcurrency: 2, // No pongas muy alto con Scraping Browser (es más caro)
+
+    // Detectar bloqueos y reintentar
+    failedRequestHandler: async ({ request, log }, error) => {
+        log.error(`❌ Falló ${request.url}: ${error.message}`);
+        await Dataset.pushData({
+            url: request.url,
+            error: error.message,
+            status: 'failed',
+            scrapedAt: new Date().toISOString(),
+        });
     },
 });
 
-await crawler.run(startUrls);
+// Forzamos la conexión al Scraping Browser de Bright Data
+crawler.launchContext.launcher = {
+    launch: async () => {
+        const { chromium } = await import('playwright');
+        return chromium.connectOverCDP(BRIGHTDATA_WS);
+    },
+};
 
-// Exit successfully
+// Agregamos las URLs
+await crawler.addRequests(
+    input.startUrls.map((item) => ({
+        url: item.url,
+        label: 'detail',
+    }))
+);
+
+log.info(`🚀 Iniciando scraper con Bright Data Scraping Browser...`);
+await crawler.run();
+
+log.info(`🏁 Finalizado`);
 await Actor.exit();
