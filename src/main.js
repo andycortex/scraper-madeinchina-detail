@@ -10,47 +10,38 @@ if (!input?.startUrls?.length) {
     throw new Error('No startUrls provided in input.');
 }
 
-// === Bright Data Scraping Browser ===
 const BRIGHTDATA_WS = 'wss://brd-customer-hl_d6363161-zone-scraping_browser_madeinchina:h58qk983tfgf@brd.superproxy.io:9222';
 
 const crawler = new PlaywrightCrawler({
-    // Conectar al browser remoto de Bright Data
-    launchContext: {
-        launchOptions: {
-            // No lanzamos browser local, usamos el remoto
-        },
-    },
+    maxRequestRetries: 4,
+    navigationTimeoutSecs: 120,
+    requestHandlerTimeoutSecs: 150,
+    minConcurrency: 1,
+    maxConcurrency: 1, // importante: solo 1 a la vez
 
-    // Usamos el endpoint CDP de Bright Data
-    browserPoolOptions: {
-        useFingerprints: false, // Bright Data ya maneja el fingerprint
-    },
-
-    // Configuración importante para Scraping Browser
     preNavigationHooks: [
-        async ({ page, request }) => {
-            // Opcional: headers extra
+        async ({ page }) => {
+            // Headers más realistas
             await page.setExtraHTTPHeaders({
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://www.made-in-china.com/',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'sec-ch-ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'Upgrade-Insecure-Requests': '1',
+            });
+
+            // Evitar detección de webdriver
+            await page.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             });
         },
     ],
 
     requestHandler: router,
 
-    // Timeouts más generosos (Made-in-China es lento)
-    navigationTimeoutSecs: 90,
-    requestHandlerTimeoutSecs: 120,
-
-    // Reintentos
-    maxRequestRetries: 3,
-
-    // Delays entre requests
-    minConcurrency: 1,
-    maxConcurrency: 2, // No pongas muy alto con Scraping Browser (es más caro)
-
-    // Detectar bloqueos y reintentar
     failedRequestHandler: async ({ request, log }, error) => {
         log.error(`❌ Falló ${request.url}: ${error.message}`);
         await Dataset.pushData({
@@ -62,24 +53,24 @@ const crawler = new PlaywrightCrawler({
     },
 });
 
-// Forzamos la conexión al Scraping Browser de Bright Data
+// Conexión a Bright Data Scraping Browser
 crawler.launchContext.launcher = {
     launch: async () => {
         const { chromium } = await import('playwright');
-        return chromium.connectOverCDP(BRIGHTDATA_WS);
+        const browser = await chromium.connectOverCDP(BRIGHTDATA_WS);
+        return browser;
     },
 };
 
-// Agregamos las URLs
 await crawler.addRequests(
     input.startUrls.map((item) => ({
         url: item.url,
         label: 'detail',
+        // Forzar que no use cache
+        uniqueKey: `${item.url}?t=${Date.now()}`,
     }))
 );
 
-log.info(`🚀 Iniciando scraper con Bright Data Scraping Browser...`);
+console.log('🚀 Iniciando con configuración anti-detección...');
 await crawler.run();
-
-log.info(`🏁 Finalizado`);
 await Actor.exit();

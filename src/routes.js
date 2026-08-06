@@ -4,30 +4,41 @@ import * as cheerio from 'cheerio';
 export const router = createPlaywrightRouter();
 
 router.addHandler('detail', async ({ request, page, log }) => {
-    const url = request.loadedUrl || request.url;
+    const originalUrl = request.url;
+    log.info(`🛒 Intentando: ${originalUrl}`);
 
-    log.info(`🛒 Scraping: ${url}`);
-
-    // Esperar a que cargue contenido importante
-    await page.waitForSelector('body', { timeout: 20000 }).catch(() => {});
-    
-    // Pequeña espera extra para que termine de renderizar JS
-    await page.waitForTimeout(2000 + Math.random() * 1500);
-
-    const currentUrl = page.url();
-
-    // Detectar CAPTCHA
-    if (currentUrl.includes('captcha') || currentUrl.includes('verification.html')) {
-        throw new Error(`⛔ CAPTCHA detectado en ${currentUrl}`);
+    // Esperar más tiempo y de forma más inteligente
+    try {
+        await page.waitForLoadState('domcontentloaded', { timeout: 45000 });
+        await page.waitForTimeout(3000 + Math.random() * 2000);
+    } catch (e) {
+        log.warning('Timeout esperando carga');
     }
 
-    // Detectar redirect a homepage
+    const currentUrl = page.url();
+    log.info(`📍 URL final: ${currentUrl}`);
+
+    // Detectar CAPTCHA
+    if (currentUrl.includes('captcha.made-in-china.com') || currentUrl.includes('verification.html')) {
+        throw new Error(`⛔ CAPTCHA detectado → ${currentUrl}`);
+    }
+
+    // Detectar homepage (solo si realmente está en la raíz)
     if (
         currentUrl === 'https://www.made-in-china.com/' ||
         currentUrl === 'https://www.made-in-china.com' ||
-        currentUrl.endsWith('made-in-china.com/')
+        (currentUrl.includes('made-in-china.com/') && !currentUrl.includes('/product/'))
     ) {
-        throw new Error(`⛔ Redirigido a homepage desde ${url}`);
+        // Guardar HTML para debug
+        const html = await page.content();
+        await Dataset.pushData({
+            url: originalUrl,
+            finalUrl: currentUrl,
+            status: 'redirected_to_homepage',
+            htmlLength: html.length,
+            scrapedAt: new Date().toISOString(),
+        });
+        throw new Error(`⛔ Redirigido a homepage`);
     }
 
     const html = await page.content();
@@ -110,10 +121,10 @@ router.addHandler('detail', async ({ request, page, log }) => {
     });
 
     // Product ID
-    const productId = url.split('/')[4] || '';
+    const productId = originalUrl.split('/')[4] || '';
 
     const result = {
-        url,
+        originalUrl,
         finalUrl: currentUrl,
         title: title || 'Title not found',
         price: price || 0,
