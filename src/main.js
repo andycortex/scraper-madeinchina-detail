@@ -2,75 +2,116 @@ import { PlaywrightCrawler, Dataset, log } from '@crawlee/playwright';
 import { Actor } from 'apify';
 import { router } from './routes.js';
 import { setTimeout } from 'node:timers/promises';
+import * as cheerio from 'cheerio';
 
 await Actor.init();
 
 const input = await Actor.getInput();
 if (!input?.startUrls?.length) {
-    throw new Error('No startUrls provided in input.');
+    throw new Error('No startUrls provided');
 }
 
-const BRIGHTDATA_WS = 'wss://brd-customer-hl_d6363161-zone-scraping_browser_madeinchina:h58qk983tfgf@brd.superproxy.io:9222';
+const BRIGHTDATA_API_KEY = '3740c65d-25cf-4521-b637-84135ccf637a';
+const BRIGHTDATA_ZONE = 'web_unlocker_apify'; // asegúrate que esta zona exista
 
-const crawler = new PlaywrightCrawler({
-    maxRequestRetries: 4,
-    navigationTimeoutSecs: 120,
-    requestHandlerTimeoutSecs: 150,
-    minConcurrency: 1,
-    maxConcurrency: 1, // importante: solo 1 a la vez
+async function fetchWithUnlocker(url, retries = 2) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            console.log(`📡 Unlocker intento ${attempt}/${retries}: ${url}`);
 
-    preNavigationHooks: [
-        async ({ page }) => {
-            // Headers más realistas
-            await page.setExtraHTTPHeaders({
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'sec-ch-ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'Upgrade-Insecure-Requests': '1',
+            const response = await fetch('https://api.brightdata.com/request', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${BRIGHTDATA_API_KEY}`,
+                },
+                body: JSON.stringify({
+                    zone: BRIGHTDATA_ZONE,
+                    url: url,
+                    format: 'raw',
+                    country: 'cn',
+                    headers: {
+                        'Referer': 'https://www.made-in-china.com/',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                    },
+                }),
             });
 
-            // Evitar detección de webdriver
-            await page.addInitScript(() => {
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            });
-        },
-    ],
+            // 🔍 Log crítico ANTES de cualquier validación
+            console.log(`   Status: ${response.status} ${response.statusText}`);
+            console.log(`   Headers:`, Object.fromEntries(response.headers.entries()));
 
-    requestHandler: router,
+            const html = await response.text();
+            console.log(`📊 HTML recibido: ${html.length} caracteres`);
 
-    failedRequestHandler: async ({ request, log }, error) => {
-        log.error(`❌ Falló ${request.url}: ${error.message}`);
+            // Si sigue vacío pero status es 200, imprime el body crudo (puede ser JSON de error)
+            if (html.length < 500) {
+                console.log(`   Body crudo: "${html}"`);
+            }
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${html}`);
+            }
+
+            if (html.length < 25000) {
+                throw new Error(`HTML demasiado corto (${html.length})`);
+            }
+
+            if (
+                html.includes('captcha.made-in-china.com') ||
+                html.includes('verification.html') ||
+                html.includes('Just a moment...')
+            ) {
+                throw new Error('CAPTCHA detectado');
+            }
+
+            if (
+                html.includes('rel="canonical" href="https://www.made-in-china.com/"') ||
+                (html.includes('Made-in-China.com') && !html.includes('product-detail') && !html.includes('sr-proMainInfo'))
+            ) {
+                throw new Error('Redirigido a homepage');
+            }
+
+            return html;
+        } catch (err) {
+            console.warn(`⚠️ Intento ${attempt} falló: ${err.message}`);
+            if (attempt === retries) throw err;
+            await setTimeout(4000 * attempt + Math.random() * 2000);
+        }
+    }
+}
+
+for (const item of input.startUrls) {
+    const url = item.url;
+
+    try {
+        const html = await fetchWithUnlocker(url);
+        const $ = cheerio.load(html);
+
+        // === Tu lógica de extracción (puedes copiarla de routes.js) ===
+        let title = $('h1.sr-proMainInfo-baseInfoH1').first().text().trim();
+        console.log('Title:', $('title').text());
+        console.log('¿Tiene contenido de producto?', html.includes('sr-proMainInfo'));
+        const result = {
+            url,
+            title: title || 'Title not found',
+            // ... resto
+            scrapedAt: new Date().toISOString(),
+        };
+
+        await Dataset.pushData(result);
+        console.log(`✅ ${result.title}`);
+    } catch (err) {
+        console.error(`❌ ${url}: ${err.message}`);
         await Dataset.pushData({
-            url: request.url,
-            error: error.message,
+            url,
+            error: err.message,
             status: 'failed',
             scrapedAt: new Date().toISOString(),
         });
-    },
-});
+    }
 
-// Conexión a Bright Data Scraping Browser
-crawler.launchContext.launcher = {
-    launch: async () => {
-        const { chromium } = await import('playwright');
-        const browser = await chromium.connectOverCDP(BRIGHTDATA_WS);
-        return browser;
-    },
-};
+    await setTimeout(3000 + Math.random() * 2000);
+}
 
-await crawler.addRequests(
-    input.startUrls.map((item) => ({
-        url: item.url,
-        label: 'detail',
-        // Forzar que no use cache
-        uniqueKey: `${item.url}?t=${Date.now()}`,
-    }))
-);
-
-console.log('🚀 Iniciando con configuración anti-detección...');
-await crawler.run();
 await Actor.exit();
